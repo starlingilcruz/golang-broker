@@ -1,16 +1,14 @@
 package broker
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"strings"
-	"time"
+	"github.com/joho/godotenv"
 
 	"github.com/starlingilcruz/golang-broker/api"
-	"github.com/starlingilcruz/golang-broker/utils"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -27,90 +25,73 @@ type StockReponse struct {
 }
 
 type Broker struct {
-	ReceiverQueue  amqp.Queue
-	PublisherQueue amqp.Queue
+	Conn           *amqp.Connection
+	ConsumerQueue  amqp.Queue
+	ProducerQueue  amqp.Queue
 	Channel        *amqp.Channel
 }
 
-func (b *Broker) SetUp(ch *amqp.Channel) {
-	receiverQueue := os.Getenv("BR_CONSUMER_QUEUE")
-	publisherQueue := os.Getenv("BR_PRODUCER_QUEUE")
+func (b *Broker)Connect() (*amqp.Connection, *amqp.Channel) {
 
-	q1, err := ch.QueueDeclare(
-		receiverQueue, // name
+	err := godotenv.Load()
+
+	if err != nil {
+		log.Fatalf("Failed to load .env: %s", err)
+	}
+
+	amqHost := os.Getenv("RMQ_HOST")
+	amqUser := os.Getenv("RMQ_USERNAME")
+	amqPass := os.Getenv("RMQ_PASSWORD")
+	amqPort := os.Getenv("RMQ_PORT")
+
+	conn, err := amqp.Dial(fmt.Sprintf("amqp://%s:%s@%s:%s/", amqUser, amqPass, amqHost, amqPort))
+
+	if err != nil {
+		log.Println("Failed to connect to RabbitMQ")
+	}
+
+	ch, err := conn.Channel()
+
+	if err != nil {
+		log.Println("Failed to start a channel")
+	}
+
+	b.Conn    = conn
+	b.Channel = ch
+
+	return conn, ch
+}
+
+func (b *Broker)CreateQueue(queue string) (amqp.Queue, error) {
+	q, err := b.Channel.QueueDeclare(
+		queue,         // name
 		false,         // durable
 		false,         // delete when unused
 		false,         // exclusive
 		false,         // no-wait
 		nil,           // arguments
 	)
-	utils.FailOnError(err, "Failed to declare"+receiverQueue+" queue")
 
-	q2, err := ch.QueueDeclare(
-		publisherQueue, // name
-		false,          // durable
-		false,          // delete when unused
-		false,          // exclusive
-		false,          // no-wait
-		nil,            // arguments
-	)
-	utils.FailOnError(err, "Failed to declare "+publisherQueue+" queue")
-
-	b.ReceiverQueue = q1
-	b.PublisherQueue = q2
-	b.Channel = ch
-}
-
-func (b *Broker) PublishMessage(sr StockReponse) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	body, err := json.Marshal(sr)
 	if err != nil {
-		log.Printf("Response structure error %s ", err)
+		log.Println(fmt.Sprintf("Error: failed to create queue - %s", err))
 	}
 
-	err = b.Channel.PublishWithContext(ctx,
-		"",                    // exchange
-		b.PublisherQueue.Name, // routing key
-		false,                 // mandatory
-		false,                 // immediate
-		amqp.Publishing{
-			ContentType: "text/plain",
-			Body:        body,
-		})
-	utils.FailOnError(err, "Failed to publish a message")
-	log.Printf(" [x] Sent %s\n", body)
+	return q, err
 }
 
-func (b *Broker) ReadMessages() {
-	msgs, err := b.Channel.Consume(
-		b.ReceiverQueue.Name, // queue
-		"",                   // consumer
-		true,                 // auto-ack
-		false,                // exclusive
-		false,                // no-local
-		false,                // no-wait
-		nil,                  // args
-	)
-	utils.FailOnError(err, "Failed to register a consumer")
-
-	rsvdMsgs := make(chan StockRequest)
-	go messageTransformer(msgs, rsvdMsgs)
-	go processRequest(rsvdMsgs, b)
-	log.Printf(" [*] Waiting for messages. To exit press CTRL+C")
+func (b *Broker) SetUp() {
+	b.ConsumerQueue, _ = b.CreateQueue(os.Getenv("BR_CONSUMER_QUEUE"))
+	b.ProducerQueue, _ = b.CreateQueue(os.Getenv("BR_PRODUCER_QUEUE"))
 }
 
 func messageTransformer(entries <-chan amqp.Delivery, receivedMessages chan StockRequest) {
 	var sr StockRequest
 	for d := range entries {
-		log.Println("d.Body", string(d.Body))
 		err := json.Unmarshal([]byte(d.Body), &sr)
 		if err != nil {
 			log.Printf("Error on received request : %s ", err)
 			continue
 		}
-		log.Println("Received a request")
 		receivedMessages <- sr
 	}
 }
@@ -118,7 +99,6 @@ func messageTransformer(entries <-chan amqp.Delivery, receivedMessages chan Stoc
 func processRequest(s <-chan StockRequest, b *Broker) {
 
 	for r := range s {
-		log.Println("processing stock request for ", r.RoomId)
 		cM := r.Message
 		cM = strings.Replace(cM, "/stock=", "", 1)
 		sr := StockReponse{
@@ -132,6 +112,5 @@ func processRequest(s <-chan StockRequest, b *Broker) {
 			Message: msg,
 		}
 		go b.PublishMessage(sr2)
-		log.Println("processed", r.Message)
 	}
 }
